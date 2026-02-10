@@ -223,7 +223,15 @@ func startMuxTunnel(conn net.Conn, leftoverReader io.Reader, password string, mo
 	aead, _ := cipher.NewGCM(block)
 	pr, pw := io.Pipe()
 
-	mc := &MinecraftConn{conn: conn, r: pr, w: pw, aead: aead, rawReader: leftoverReader, motion: motion}
+	mc := &MinecraftConn{
+		conn:      conn,
+		r:         pr,
+		w:         pw,
+		aead:      aead,
+		rawReader: leftoverReader,
+		motion:    motion,
+		buf:       new(bytes.Buffer),
+	}
 
 	go func() {
 		defer pw.Close()
@@ -292,7 +300,13 @@ func startMuxTunnel(conn net.Conn, leftoverReader io.Reader, password string, mo
 		}
 	}()
 
-	session, err := yamux.Server(mc, nil)
+	// Yamux Optimization: Increase window size for better throughput
+	ymConfig := yamux.DefaultConfig()
+	ymConfig.MaxStreamWindowSize = 512 * 1024 // 512KB
+	ymConfig.LogOutput = io.Discard
+	ymConfig.KeepAliveInterval = 30 * time.Second
+
+	session, err := yamux.Server(mc, ymConfig)
 	if err != nil {
 		return
 	}
@@ -331,21 +345,61 @@ func handleStream(stream net.Conn) {
 // MinecraftConn wraps a net.Conn to encrypt/decrypt data and disguise it as Minecraft packets.
 
 type MinecraftConn struct {
-	conn      net.Conn
-	r         *io.PipeReader
-	w         *io.PipeWriter
-	aead      cipher.AEAD
-	rawReader io.Reader
-	motion    *MotionGenerator
+	conn       net.Conn
+	r          *io.PipeReader
+	w          *io.PipeWriter
+	aead       cipher.AEAD
+	rawReader  io.Reader
+	motion     *MotionGenerator
+	buf        *bytes.Buffer
+	bufLock    sync.Mutex
+	flushTimer *time.Timer
 }
 
 func (mc *MinecraftConn) Read(b []byte) (int, error) { return mc.r.Read(b) }
 
-// Write encrypts data and wraps it in a realistic Minecraft chunk data packet.
+// Write buffers data to reduce packet overhead.
+// It flushes if buffer > 4KB or after 5ms.
 func (mc *MinecraftConn) Write(b []byte) (int, error) {
+	mc.bufLock.Lock()
+	defer mc.bufLock.Unlock()
+
+	mc.buf.Write(b)
+
+	// Threshold for immediate flush (4KB)
+	if mc.buf.Len() >= 4096 {
+		return mc.flush()
+	}
+
+	// Schedule delayed flush if not already running
+	if mc.flushTimer == nil {
+		mc.flushTimer = time.AfterFunc(5*time.Millisecond, func() {
+			mc.bufLock.Lock()
+			defer mc.bufLock.Unlock()
+			mc.flush()
+		})
+	}
+
+	return len(b), nil
+}
+
+// flush wraps the buffered data in a Minecraft packet and sends it.
+// Caller must hold bufLock.
+func (mc *MinecraftConn) flush() (int, error) {
+	if mc.flushTimer != nil {
+		mc.flushTimer.Stop()
+		mc.flushTimer = nil
+	}
+
+	if mc.buf.Len() == 0 {
+		return 0, nil
+	}
+
+	// Encrypt the buffered data
+	data := mc.buf.Bytes()
 	nonce := make([]byte, mc.aead.NonceSize())
 	rand.Read(nonce)
-	encrypted := mc.aead.Seal(nonce, nonce, b, nil)
+	encrypted := mc.aead.Seal(nonce, nonce, data, nil)
 
 	buf := new(bytes.Buffer)
 
@@ -392,7 +446,10 @@ func (mc *MinecraftConn) Write(b []byte) (int, error) {
 	WriteVarInt(buf, 0)
 
 	err := WritePacket(mc.conn, PID_CB_ChunkData, buf.Bytes())
-	return len(b), err
+
+	n := mc.buf.Len()
+	mc.buf.Reset()
+	return n, err
 }
 
 // createPackedHeights generates packed height data for Minecraft chunk heightmaps.
