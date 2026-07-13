@@ -27,9 +27,20 @@ check_root() {
 
 check_deps() {
     echo "[Checking dependencies...]"
+
+    # If a prebuilt binary is present alongside this script, we don't need Go.
+    if [ -x "./$BINARY_NAME" ]; then
+        USE_PREBUILT=1
+        echo "✓ Prebuilt binary found: ./$BINARY_NAME (skipping compilation)"
+        echo ""
+        return 0
+    fi
+
+    USE_PREBUILT=0
     if ! command -v go &> /dev/null; then
-        echo "Error: Go compiler not found!"
-        echo "Please install Go from https://golang.org/dl/"
+        echo "Error: Go compiler not found and no prebuilt './$BINARY_NAME' present!"
+        echo "Either install Go from https://golang.org/dl/,"
+        echo "or place a prebuilt '$BINARY_NAME' binary next to this script."
         exit 1
     fi
     echo "✓ Go compiler found: $(go version)"
@@ -51,6 +62,13 @@ detect_installed_version() {
 }
 
 compile_server() {
+    if [ "${USE_PREBUILT:-0}" -eq 1 ]; then
+        echo "[Using prebuilt binary, skipping compilation...]"
+        echo "✓ Using existing ./$BINARY_NAME"
+        echo ""
+        return 0
+    fi
+
     echo "[Compiling Minewire server...]"
     go build -o $BINARY_NAME -ldflags="-s -w" .
     if [ ! -f "$BINARY_NAME" ]; then
@@ -168,9 +186,11 @@ main() {
     fi
 
     install_files
-    
-    # Cleanup build artifact
-    rm -f $BINARY_NAME
+
+    # Cleanup build artifact (only if we compiled it; keep a user-supplied prebuilt binary)
+    if [ "${USE_PREBUILT:-0}" -ne 1 ]; then
+        rm -f $BINARY_NAME
+    fi
     rm -rf $DATA_BACKUP
 
     echo ""
